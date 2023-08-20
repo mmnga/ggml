@@ -22,30 +22,115 @@ import struct
 import json
 import torch
 import numpy as np
+from pathlib import Path
+from typing import (IO, TYPE_CHECKING, Any, Callable, Dict, Iterable, List,
+                    Literal, Optional, Sequence, Tuple, TypeVar, Union)
+from sentencepiece import SentencePieceProcessor
 
-from transformers import GPTJForCausalLM
+vocab_bpe_json_name = "vocab.json"
+vocab_added_tokens_json_name = "added_tokens_.json"
+vocab_model_name = "spiece.model"
 
-# ref: https://github.com/openai/gpt-2/blob/master/src/encoder.py
-def bytes_to_unicode():
-    """
-    Returns list of utf-8 byte and a corresponding list of unicode strings.
-    The reversible bpe codes work on unicode strings.
-    This means you need a large # of unicode characters in your vocab if you want to avoid UNKs.
-    When you're at something like a 10B token dataset you end up needing around 5K for decent coverage.
-    This is a signficant percentage of your normal, say, 32K bpe vocab.
-    To avoid that, we want lookup tables between utf-8 bytes and unicode strings.
-    And avoids mapping to whitespace/control characters the bpe code barfs on.
-    """
-    bs = list(range(ord("!"), ord("~")+1))+list(range(ord("¡"), ord("¬")+1))+list(range(ord("®"), ord("ÿ")+1))
-    cs = bs[:]
-    n = 0
-    for b in range(2**8):
-        if b not in bs:
-            bs.append(b)
-            cs.append(2**8+n)
-            n += 1
-    cs = [chr(n) for n in cs]
-    return dict(zip(bs, cs))
+vocabtype = "no bpe" # read spiece.model
+# vocabtype = "bpe" # read vocab.json
+
+
+class SentencePieceVocab:
+    def __init__(self, fname_tokenizer: Path, fname_added_tokens: Optional[Path], vocabtype: Optional[str]) -> None:
+        self.vocabtype = vocabtype
+        if self.vocabtype == "bpe":
+          self.sentencepiece_tokenizer = json.loads(open(str(fname_tokenizer)).read())
+        else:
+          self.sentencepiece_tokenizer = SentencePieceProcessor(str(fname_tokenizer))
+        added_tokens: Dict[str, int]
+        if fname_added_tokens is not None:
+            added_tokens = json.load(open(fname_added_tokens))
+        else:
+            added_tokens = {}
+        if self.vocabtype == "bpe":
+          vocab_size: int = len(self.sentencepiece_tokenizer)
+        else:
+          vocab_size: int = self.sentencepiece_tokenizer.vocab_size()
+        expected_ids = list(range(vocab_size, vocab_size + len(added_tokens)))
+        actual_ids = sorted(added_tokens.values())
+        if expected_ids != actual_ids:
+            raise Exception(f"Expected added token IDs to be sequential and start at {len(added_tokens)}; got {actual_ids}")
+        items = sorted(added_tokens.items(), key=lambda text_idx: text_idx[1])
+        self.added_tokens_list = [text for (text, idx) in items]
+        self.vocab_size_base: int = vocab_size
+        self.vocab_size: int = self.vocab_size_base + len(self.added_tokens_list)
+        self.fname_tokenizer = fname_tokenizer
+        self.fname_added_tokens = fname_added_tokens
+
+    def vocab_size(self) -> int:
+        return self.sentencepiece_tokenizer.vocab_size()
+
+    def sentencepiece_tokens(self) -> Iterable[Tuple[bytes, float]]:
+        tokenizer = self.sentencepiece_tokenizer
+        if self.vocabtype == "bpe":
+          from transformers.models.gpt2 import tokenization_gpt2
+          byte_encoder = tokenization_gpt2.bytes_to_unicode()
+          byte_decoder = {v: k for k, v in byte_encoder.items()}
+          for i, item in enumerate(tokenizer):
+            text: bytes
+            text = b''.join([x.to_bytes(1, byteorder='big') for x in [byte_decoder[y] for y in item]])
+            score: float = -i
+            yield text, score
+        else:
+          for i in range(tokenizer.vocab_size()):
+              text: bytes
+              if tokenizer.is_unknown(i):
+                  text = " \u2047 ".encode("utf-8")
+              elif tokenizer.is_control(i):
+                  text = b""
+              elif tokenizer.is_byte(i):
+                  piece = tokenizer.id_to_piece(i)
+                  if len(piece) != 6:
+                      raise Exception(f"Invalid token: {piece}")
+                  byte_value = int(piece[3:-1], 16)
+                  text = struct.pack("B", byte_value)
+              else:
+                  text = tokenizer.id_to_piece(i).replace("\u2581", " ").encode("utf-8")
+              score: float = tokenizer.get_score(i)
+              yield text, score
+
+    def added_tokens(self) -> Iterable[Tuple[bytes, float]]:
+        for text in self.added_tokens_list:
+            score = -1000.0
+            yield text.encode("utf-8"), score
+
+    def all_tokens(self) -> Iterable[Tuple[bytes, float]]:
+        yield from self.sentencepiece_tokens()
+        yield from self.added_tokens()
+
+    def __repr__(self) -> str:
+        return f"<SentencePieceVocab with {self.vocab_size_base} base tokens and {len(self.added_tokens_list)} added tokens>"
+
+def load_vocab(path: Path, vocabtype: Optional[str]) -> SentencePieceVocab:
+    print(f"vocabtype: {vocabtype}")
+    # Be extra-friendly and accept either a file or a directory.  Also, if it's
+    # a directory, it might be the model directory, and tokenizer.model might
+    # be in the parent of that.
+    if path.is_dir():
+        vocab_file = vocab_model_name
+        if vocabtype == 'bpe':
+          vocab_file = vocab_bpe_json_name
+        path2 = path / vocab_file
+        # Use `.parent` instead of /.. to handle the symlink case better.
+        path3 = path.parent / vocab_file
+        if path2.exists():
+            path = path2
+        elif path3.exists():
+            path = path3
+        else:
+            raise FileNotFoundError(
+                f"Could not find tokenizer.model in {path} or its parent; "
+                "if it's in another directory, pass the directory as --vocab-dir")
+    added_tokens_path = path.parent / vocab_added_tokens_json_name
+    print(f"Loading vocab file {path}")
+    return SentencePieceVocab(path, added_tokens_path if added_tokens_path.exists() else None,
+                              vocabtype)
+
 
 if len(sys.argv) < 3:
     print("Usage: convert-h5-to-ggml.py dir-model [use-f32]\n")
@@ -56,12 +141,6 @@ if len(sys.argv) < 3:
 # output in the same directory as the model
 dir_model = sys.argv[1]
 fname_out = sys.argv[1] + "/ggml-model.bin"
-
-with open(dir_model + "/vocab.json", "r", encoding="utf-8") as f:
-    encoder = json.load(f)
-
-with open(dir_model + "/added_tokens.json", "r", encoding="utf-8") as f:
-    encoder_added = json.load(f)
 
 with open(dir_model + "/config.json", "r", encoding="utf-8") as f:
     hparams = json.load(f)
@@ -82,11 +161,7 @@ if len(sys.argv) > 2:
     fname_out = sys.argv[1] + "/ggml-model-" + ftype_str[ftype] + ".bin"
 
 
-model = GPTJForCausalLM.from_pretrained(dir_model, low_cpu_mem_usage=True)
-#print (model)
-
-list_vars = model.state_dict()
-#print (list_vars)
+vocab = load_vocab(Path(dir_model), vocabtype)
 
 fout = open(fname_out, "wb")
 
@@ -99,20 +174,26 @@ fout.write(struct.pack("i", hparams["n_layer"]))
 fout.write(struct.pack("i", hparams["rotary_dim"]))
 fout.write(struct.pack("i", ftype))
 
-byte_encoder = bytes_to_unicode()
-byte_decoder = {v:k for k, v in byte_encoder.items()}
+# TODO: temporary hack to not deal with implementing the tokenizer
+fout.write(struct.pack("i", hparams["vocab_size"]))
 
-fout.write(struct.pack("i", len(encoder) + len(encoder_added)))
-
-for key in encoder:
-    text = bytearray([byte_decoder[c] for c in key])
+i = 0
+for text, score in vocab.all_tokens():
     fout.write(struct.pack("i", len(text)))
     fout.write(text)
+    # fout.write(struct.pack("f", score))
+    i+=1
 
-for key in encoder_added:
-    text = bytearray([byte_decoder[c] for c in key])
-    fout.write(struct.pack("i", len(text)))
-    fout.write(text)
+for _ in range(hparams["vocab_size"]-i):
+    fout.write(struct.pack("i", 0))
+
+
+from transformers import GPTJForCausalLM
+model = GPTJForCausalLM.from_pretrained(dir_model, low_cpu_mem_usage=True)
+#print (model)
+
+list_vars = model.state_dict()
+#print (list_vars)
 
 for name in list_vars.keys():
     data = list_vars[name].squeeze().numpy()
