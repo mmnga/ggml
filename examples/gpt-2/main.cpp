@@ -739,12 +739,27 @@ int main(int argc, char ** argv) {
         test_gpt_tokenizer(vocab, params.token_test);
     }
 
+    // find eos token id
+    gpt_vocab::id eos_id = -1;
+    {
+        std::vector<gpt_vocab::token> eos_tokens = {"<|endoftext|>", "</s>", "[EOS]"};
+        for(auto& token : eos_tokens) {
+            if (vocab.token_to_id.find(token) != vocab.token_to_id.end()) {
+                eos_id = vocab.token_to_id[token];
+                break;
+            }
+        }
+        printf("eos token id %d\n", eos_id);
+    }
+
     int n_past = 0;
 
     int64_t t_sample_us  = 0;
     int64_t t_predict_us = 0;
 
     std::vector<float> logits;
+    std::vector<int32_t> last_n_tokens(model.hparams.n_ctx);
+    std::fill(last_n_tokens.begin(), last_n_tokens.end(), 0);
 
     // tokenize the prompt
     std::vector<gpt_vocab::id> embd_inp = ::gpt_tokenize(vocab, params.prompt);
@@ -795,17 +810,25 @@ int main(int argc, char ** argv) {
             {
                 const int64_t t_start_sample_us = ggml_time_us();
 
-                id = gpt_sample_top_k_top_p(vocab, logits.data() + (logits.size() - n_vocab), top_k, top_p, temp, rng);
+                id = gpt_sample_top_k_top_p_repeat(vocab, logits.data() + (logits.size() - n_vocab), last_n_tokens.data(), last_n_tokens.size(), top_k, top_p, temp, params.repeat_last_n, params.repeat_penalty, rng);
 
                 t_sample_us += ggml_time_us() - t_start_sample_us;
             }
 
             // add it to the context
             embd.push_back(id);
+
+            last_n_tokens.erase(last_n_tokens.begin());
+            last_n_tokens.push_back(id);
+
         } else {
             // if here, it means we are still processing the input prompt
             for (int k = i; k < embd_inp.size(); k++) {
                 embd.push_back(embd_inp[k]);
+
+                last_n_tokens.erase(last_n_tokens.begin());
+                last_n_tokens.push_back(embd_inp[k]);
+
                 if (embd.size() >= params.n_batch) {
                     break;
                 }
@@ -820,7 +843,7 @@ int main(int argc, char ** argv) {
         fflush(stdout);
 
         // end of text token
-        if (embd.back() == 50256) {
+        if (embd.back() == eos_id) {
             break;
         }
     }

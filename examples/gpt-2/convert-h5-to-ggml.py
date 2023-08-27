@@ -22,8 +22,9 @@ import struct
 import json
 import numpy as np
 import re
+from pathlib import Path
 
-from transformers import GPT2Model
+from transformers import GPT2LMHeadModel, AutoTokenizer
 
 # ref: https://github.com/openai/gpt-2/blob/master/src/encoder.py
 def bytes_to_unicode():
@@ -53,28 +54,22 @@ if len(sys.argv) < 2:
 
 # output in the same directory as the model
 dir_model = sys.argv[1]
-fname_out = sys.argv[1] + "/ggml-model.bin"
+fname_out = sys.argv[1] + "/ggml-model-f16.bin"
 
-with open(dir_model + "/vocab.json", "r", encoding="utf-8") as f:
-    encoder = json.load(f)
-
-with open(dir_model + "/added_tokens.json", "r", encoding="utf-8") as f:
-    encoder_added = json.load(f)
+encoder = {}
+encoder_added = {}
 
 with open(dir_model + "/config.json", "r", encoding="utf-8") as f:
     hparams = json.load(f)
 
 # use 16-bit or 32-bit floats
 use_f16 = True
-if len(sys.argv) > 2:
+if len(sys.argv) > 2 and int(sys.argv[2]) != 1:
     use_f16 = False
     fname_out = sys.argv[1] + "/ggml-model-f32.bin"
 
-model = GPT2Model.from_pretrained(dir_model, low_cpu_mem_usage=True)
-#print (model)
-
-list_vars = model.state_dict()
-#print (list_vars)
+byte_encoder = bytes_to_unicode()
+byte_decoder = {v:k for k, v in byte_encoder.items()}
 
 fout = open(fname_out, "wb")
 
@@ -87,93 +82,144 @@ fout.write(struct.pack("i", hparams["n_layer"]))
 #fout.write(struct.pack("i", hparams["rotary_dim"]))
 fout.write(struct.pack("i", use_f16))
 
-byte_encoder = bytes_to_unicode()
-byte_decoder = {v:k for k, v in byte_encoder.items()}
+# TODO: temporary hack to not deal with implementing the tokenizer
 
-fout.write(struct.pack("i", len(encoder) + len(encoder_added)))
+if Path(dir_model + "/vocab.json").is_file():
 
-for key in encoder:
-    text = bytearray([byte_decoder[c] for c in key])
-    fout.write(struct.pack("i", len(text)))
-    fout.write(text)
+    with open(dir_model + "/vocab.json", "r", encoding="utf-8") as f:
+        encoder = json.load(f)
 
-for key in encoder_added:
-    text = bytearray([byte_decoder[c] for c in key])
-    fout.write(struct.pack("i", len(text)))
-    fout.write(text)
+    if Path(dir_model + "/added_tokens.json").is_file():
+        with open(dir_model + "/added_tokens.json", "r", encoding="utf-8") as f:
+            encoder_added = json.load(f)
+
+    fout.write(struct.pack("i", len(encoder) + len(encoder_added)))
+    for key in encoder:
+        text = bytearray([byte_decoder[c] for c in key])
+        fout.write(struct.pack("i", len(text)))
+        fout.write(text)
+
+    for key in encoder_added:
+        text = bytearray([byte_decoder[c] for c in key])
+        fout.write(struct.pack("i", len(text)))
+        fout.write(text)
+
+else:
+    
+    tokenizer = AutoTokenizer.from_pretrained(dir_model,use_fast=False )
+    tk_vocab = tokenizer.get_vocab()
+    vocab_size = len(tk_vocab)
+    reverse_vocab = {tk_vocab[key]: key for key in tk_vocab.keys()}
+
+    fout.write(struct.pack("i", vocab_size))
+    for i in range(vocab_size):
+        text: bytes
+        if tokenizer.sp_model.is_unknown(i):
+            text = " \u2047 ".encode("utf-8")
+        elif tokenizer.sp_model.is_control(i):
+            text = tokenizer.decode([i]).encode("utf-8")
+        elif tokenizer.sp_model.is_byte(i):
+            piece = tokenizer.sp_model.id_to_piece(i)
+            if len(piece) != 6:
+                raise Exception(f"Invalid token: {piece}")
+            byte_value = int(piece[3:-1], 16)
+            text = struct.pack("B", byte_value)
+        else:
+            text = tokenizer.sp_model.id_to_piece(i).replace("\u2581", " ").encode("utf-8")
+
+        fout.write(struct.pack("i", len(text)))
+        fout.write(text)
+
+
+# MODEL
+model = GPT2LMHeadModel.from_pretrained(dir_model, low_cpu_mem_usage=True)
+#print (model)
+
+list_vars = model.state_dict()
+#print (list_vars)
 
 for name in list_vars.keys():
     data = list_vars[name].squeeze().numpy()
     print("Processing variable: " + name + " with shape: ", data.shape)
 
     # we don't need these
-    if name.endswith("attn.masked_bias") or name.endswith(".attn.bias"):
+    if name.endswith("attn.masked_bias") \
+        or name.endswith(".attn.bias") :
         print("  Skipping variable: " + name)
         continue
 
-    n_dims = len(data.shape);
+    n_dims = len(data.shape)
 
     # ftype == 0 -> float32, ftype == 1 -> float16
-    ftype = 0;
+    ftype_cur = 0
     if use_f16:
-        if name[-7:] == ".weight" and n_dims == 2:
+        if name[-7:] == ".weight" and n_dims == 2 and not name.endswith("wpe.weight"):
             print("  Converting to float16")
             data = data.astype(np.float16)
-            ftype = 1
+            ftype_cur = 1
         else:
             print("  Converting to float32")
             data = data.astype(np.float32)
-            ftype = 0
+            ftype_cur = 0
+    else:
+        if data.dtype != np.float32:
+            print("  Converting to float32")
+            data = data.astype(np.float32)
+            ftype_cur = 0
 
     # for efficiency - transpose these matrices:
-    #  "transformer.h.*.mlp.c_proj.weight
-    if name.endswith(".mlp.c_proj.weight"):
+    if name.endswith(".mlp.c_proj.weight") \
+    or re.match(r".*h\.\d+\.attn\.c_attn\.weight", name) \
+    or re.match(r".*h.\d+.mlp.c_fc.weight", name) \
+    or re.match(r".*h\.\d+\.attn\.c_proj\.weight", name):
         print("  Transposing")
         data = data.transpose()
 
     # rename headers to keep compatibility
-    if name == "ln_f.weight":
+    if name.endswith("ln_f.weight"):
         name = "model/ln_f/g"
-    elif name == "ln_f.bias":
+    elif name.endswith("ln_f.bias"):
         name = "model/ln_f/b"
-    elif name == "wte.weight":
+    elif name.endswith("wte.weight"):
         name = "model/wte"
-    elif name == "wpe.weight":
+    elif name.endswith("wpe.weight"):
         name = "model/wpe"
-    elif re.match(r"h\.\d+\.ln_1\.weight", name):
+    elif name.endswith("lm_head.weight"):
+        name = "model/lm_head"
+    elif re.match(r".*h\.\d+\.ln_1\.weight", name):
         i = re.findall("\d+", name)[0]
         name = f"model/h{i}/ln_1/g"
-    elif re.match(r"h\.\d+\.ln_1\.bias", name):
+    elif re.match(r".*h\.\d+\.ln_1\.bias", name):
         i = re.findall("\d+", name)[0]
         name = f"model/h{i}/ln_1/b"
-    elif re.match(r"h\.\d+\.attn\.c_attn\.weight", name):
+    elif re.match(r".*h\.\d+\.attn\.c_attn\.weight", name):
         i = re.findall("\d+", name)[0]
         name = f"model/h{i}/attn/c_attn/w"
-    elif re.match(r"h\.\d+\.attn\.c_attn\.bias", name):
+    elif re.match(r".*h\.\d+\.attn\.c_attn\.bias", name):
         i = re.findall("\d+", name)[0]
         name = f"model/h{i}/attn/c_attn/b"
-    elif re.match(r"h\.\d+\.attn\.c_proj\.weight", name):
+    elif re.match(r".*h\.\d+\.attn\.c_proj\.weight", name):
         i = re.findall("\d+", name)[0]
         name = f"model/h{i}/attn/c_proj/w"
-    elif re.match(r"h.\d+.attn.c_proj.bias", name):
+    elif re.match(r".*h.\d+.attn.c_proj.bias", name):
         i = re.findall("\d+", name)[0]
         name = f"model/h{i}/attn/c_proj/b"
-    elif re.match(r"h.\d+.ln_2.weight", name):
+    elif re.match(r".*h.\d+.ln_2.weight", name):
         i = re.findall("\d+", name)[0]
         name = f"model/h{i}/ln_2/g"
-    elif re.match(r"h.\d+.ln_2.bias", name):
+    elif re.match(r".*h.\d+.ln_2.bias", name):
         i = re.findall("\d+", name)[0]
         name = f"model/h{i}/ln_2/b"
-    elif re.match(r"h.\d+.mlp.c_fc.weight", name):
+    elif re.match(r".*h.\d+.mlp.c_fc.weight", name):
         i = re.findall("\d+", name)[0]
         name = f"model/h{i}/mlp/c_fc/w"
-    elif re.match(r"h.\d+.mlp.c_fc.bias", name):
+    elif re.match(r".*h.\d+.mlp.c_fc.bias", name):
         i = re.findall("\d+", name)[0]
         name = f"model/h{i}/mlp/c_fc/b"
-    elif re.match(r"h.\d+.mlp.c_proj.weight", name):
+    elif re.match(r".*h.\d+.mlp.c_proj.weight", name):
         i = re.findall("\d+", name)[0]
         name = f"model/h{i}/mlp/c_proj/w"
-    elif re.match(r"h.\d+.mlp.c_proj.bias", name):
+    elif re.match(r".*h.\d+.mlp.c_proj.bias", name):
         i = re.findall("\d+", name)[0]
         name = f"model/h{i}/mlp/c_proj/b"
     else:
@@ -181,10 +227,10 @@ for name in list_vars.keys():
 
     str = name.encode('utf-8')
 
-    fout.write(struct.pack("iii", n_dims, len(str), ftype))
+    fout.write(struct.pack("iii", n_dims, len(str), ftype_cur))
     for i in range(n_dims):
         fout.write(struct.pack("i", data.shape[n_dims - 1 - i]))
-    fout.write(str);
+    fout.write(str)
 
     # data
     data.tofile(fout)
